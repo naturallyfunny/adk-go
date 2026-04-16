@@ -76,7 +76,7 @@ func (s *sessionSvc) Get(ctx context.Context, req *session.GetRequest) (*session
 			continue
 		}
 
-		role := s.zepRoleToADK(msg.Role)
+		role := s.mapRole(msg.Role)
 		evt := session.NewEvent(derefOrEmpty(msg.UUID))
 		evt.Author = role
 
@@ -109,7 +109,7 @@ func (s *sessionSvc) AppendEvent(ctx context.Context, sess session.Session, even
 	return nil
 }
 
-func (s *sessionSvc) resolveRole(role zep.RoleType) string {
+func (s *sessionSvc) mapRole(role zep.RoleType) string {
 	if role == zep.RoleTypeAssistantRole {
 		return s.agentName
 	}
