@@ -2,6 +2,7 @@ package zep
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"time"
@@ -14,21 +15,52 @@ import (
 	"google.golang.org/genai"
 )
 
-type sessionSvc struct {
-	client              *client.Client
-	agentName           string
-	contextWindowLength int
+type Option func(*SessionService)
+
+type SessionService struct {
+	client                   *client.Client
+	agentName                string
+	conversationHistory      int
+	includeKnowledge         bool
+	knowledgeContextTemplate *string
 }
 
-func NewSessionService(client *client.Client, agentName string, contextWindowLength int) *sessionSvc {
-	return &sessionSvc{
-		client:              client,
-		agentName:           agentName,
-		contextWindowLength: contextWindowLength,
+func WithConversationHistory(n int) Option {
+	return func(s *SessionService) {
+		s.conversationHistory = n
 	}
 }
 
-func (s *sessionSvc) Create(_ context.Context, req *session.CreateRequest) (*session.CreateResponse, error) {
+func WithKnowledgeContext(contextTemplateID *string) Option {
+	return func(s *SessionService) {
+		s.includeKnowledge = true
+		s.knowledgeContextTemplate = contextTemplateID
+	}
+}
+
+func NewSessionService(client *client.Client, agentName string, opts ...Option) *SessionService {
+	s := &SessionService{
+		client:              client,
+		agentName:           agentName,
+		conversationHistory: 0,
+		includeKnowledge:    false,
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+func (s *SessionService) Create(ctx context.Context, req *session.CreateRequest) (*session.CreateResponse, error) {
+	if err := s.ensureUser(ctx, req.UserID); err != nil {
+		return nil, fmt.Errorf("zep ensure user: %w", err)
+	}
+	if _, err := s.client.Thread.Create(ctx, &zep.CreateThreadRequest{
+		ThreadID: req.SessionID,
+		UserID:   req.UserID,
+	}); err != nil {
+		return nil, fmt.Errorf("zep create thread: %w", err)
+	}
 	return &session.CreateResponse{
 		Session: &zepSession{
 			id:     req.SessionID,
@@ -38,45 +70,146 @@ func (s *sessionSvc) Create(_ context.Context, req *session.CreateRequest) (*ses
 	}, nil
 }
 
-func (s *sessionSvc) Get(ctx context.Context, req *session.GetRequest) (*session.GetResponse, error) {
+func (s *SessionService) ensureUser(ctx context.Context, userID string) error {
+	_, err := s.client.User.Get(ctx, userID)
+	if err == nil {
+		return nil
+	}
+	var notFound *zep.NotFoundError
+	if !errors.As(err, &notFound) {
+		return err
+	}
+	_, err = s.client.User.Add(ctx, &zep.CreateUserRequest{UserID: userID})
+	return err
+}
+
+func (s *SessionService) mapRoleToZep(role string) zep.RoleType {
+	if role == "user" || role == "human" {
+		return zep.RoleType("human")
+	}
+	return zep.RoleType("ai")
+}
+
+func (s *SessionService) AppendEvent(ctx context.Context, sess session.Session, event *session.Event) error {
+	if event == nil {
+		return nil
+	}
+
+	zepRole := s.mapRoleToZep(event.Author)
+
+	var contentStr string
+	if event.Content != nil {
+		for _, part := range event.Content.Parts {
+			if part.Text != "" {
+				contentStr += part.Text
+			}
+		}
+	}
+
+	_, err := s.client.Thread.AddMessages(ctx, sess.ID(), &zep.AddThreadMessagesRequest{
+		Messages: []*zep.Message{
+			{
+				Role:    zepRole,
+				Content: contentStr,
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	if impl, ok := sess.(*zepSession); ok {
+		impl.events = append(impl.events, event)
+	}
+
+	return nil
+}
+
+func (s *SessionService) Get(ctx context.Context, req *session.GetRequest) (*session.GetResponse, error) {
 	sess := &zepSession{
 		id:     req.SessionID,
 		userID: req.UserID,
 		app:    req.AppName,
 	}
 
-	resp, err := s.client.Thread.Get(ctx, req.SessionID, &zep.ThreadGetRequest{
-		Lastn: zep.Int(s.contextWindowLength),
-	})
+	events, err := s.buildContext(ctx, req.SessionID)
 	if err != nil {
-		fmt.Printf("failed to fetch thread messages from zep: %v\n", err)
-		return &session.GetResponse{Session: sess}, nil
+		return nil, err
 	}
 
-	contextResp, ctxErr := s.client.Thread.GetUserContext(ctx, req.SessionID, &zep.ThreadGetUserContextRequest{})
-	if ctxErr != nil {
-		fmt.Printf("failed to fetch user context from zep: %v\n", ctxErr)
-	} else if contextResp != nil && contextResp.GetContext() != nil {
-		ctxStr := *contextResp.GetContext()
-		if ctxStr != "" {
-			evt := session.NewEvent("context-injection")
-			evt.Author = "Zep (Context Engine)"
+	sess.events = events
 
-			wrappedCtx := fmt.Sprintf("[SYSTEM BACKGROUND CONTEXT - DO NOT ACKNOWLEDGE DIRECTLY]\n%s\n[END BACKGROUND CONTEXT]", ctxStr)
+	return &session.GetResponse{Session: sess}, nil
+}
 
-			evt.LLMResponse = model.LLMResponse{
-				Content: genai.NewContentFromText(wrappedCtx, genai.Role("user")),
-			}
-			sess.events = append(sess.events, evt)
+func (s *SessionService) buildContext(ctx context.Context, sessionID string) ([]*session.Event, error) {
+	var events []*session.Event
+
+	if s.includeKnowledge {
+		knowledge, err := s.fetchKnowledge(ctx, sessionID, s.knowledgeContextTemplate)
+		if err != nil {
+			return nil, err
+		}
+		if knowledge != "" {
+			events = append(events, s.newSystemEvent("knowledge", knowledge))
 		}
 	}
 
+	// fetchHistory is always called: it verifies the thread exists in Zep,
+	// which lets the ADK runner trigger Create (via autoCreateSession) when needed.
+	history, err := s.fetchHistory(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	events = append(events, history...)
+
+	return events, nil
+}
+
+func (s *SessionService) fetchKnowledge(ctx context.Context, sessionID string, templateID *string) (string, error) {
+	resp, err := s.client.Thread.GetUserContext(ctx, sessionID, &zep.ThreadGetUserContextRequest{
+		TemplateID: templateID,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	if resp == nil || resp.GetContext() == nil {
+		return "", nil
+	}
+
+	ctxStr := *resp.GetContext()
+	if ctxStr == "" {
+		return "", nil
+	}
+
+	return fmt.Sprintf("[KNOWLEDGE]\n%s\n[/KNOWLEDGE]", ctxStr), nil
+}
+
+func (s *SessionService) fetchHistory(ctx context.Context, sessionID string) ([]*session.Event, error) {
+	lastn := s.conversationHistory
+	if lastn == 0 {
+		lastn = 1 // minimum fetch to verify the thread exists in Zep
+	}
+
+	resp, err := s.client.Thread.Get(ctx, sessionID, &zep.ThreadGetRequest{
+		Lastn: zep.Int(lastn),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if s.conversationHistory == 0 {
+		return nil, nil // thread verified; caller requested no history
+	}
+
+	var events []*session.Event
 	for _, msg := range resp.GetMessages() {
 		if msg == nil {
 			continue
 		}
 
-		role := s.mapRole(msg.Role)
+		role := s.unmapRole(msg.Role)
 		evt := session.NewEvent(derefOrEmpty(msg.UUID))
 		evt.Author = role
 
@@ -88,32 +221,36 @@ func (s *sessionSvc) Get(ctx context.Context, req *session.GetRequest) (*session
 		evt.LLMResponse = model.LLMResponse{
 			Content: genai.NewContentFromText(msg.Content, genai.Role(contentRole)),
 		}
-		sess.events = append(sess.events, evt)
+		events = append(events, evt)
 	}
 
-	return &session.GetResponse{Session: sess}, nil
+	return events, nil
 }
 
-func (s *sessionSvc) List(_ context.Context, _ *session.ListRequest) (*session.ListResponse, error) {
+func (s *SessionService) unmapRole(role zep.RoleType) string {
+	if role == zep.RoleType("human") {
+		return "user"
+	}
+	return s.agentName
+}
+
+func (s *SessionService) newSystemEvent(category, content string) *session.Event {
+	evt := session.NewEvent(category)
+	evt.Author = "system"
+
+	evt.LLMResponse = model.LLMResponse{
+		Content: genai.NewContentFromText(content, genai.Role("model")),
+	}
+
+	return evt
+}
+
+func (s *SessionService) List(_ context.Context, _ *session.ListRequest) (*session.ListResponse, error) {
 	return &session.ListResponse{}, nil
 }
 
-func (s *sessionSvc) Delete(_ context.Context, _ *session.DeleteRequest) error {
+func (s *SessionService) Delete(_ context.Context, _ *session.DeleteRequest) error {
 	return nil
-}
-
-func (s *sessionSvc) AppendEvent(ctx context.Context, sess session.Session, event *session.Event) error {
-	if impl, ok := sess.(*zepSession); ok {
-		impl.events = append(impl.events, event)
-	}
-	return nil
-}
-
-func (s *sessionSvc) mapRole(role zep.RoleType) string {
-	if role == zep.RoleTypeAssistantRole {
-		return s.agentName
-	}
-	return "user"
 }
 
 func derefOrEmpty(s *string) string {
