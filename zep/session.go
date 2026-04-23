@@ -84,10 +84,14 @@ func (s *SessionService) ensureUser(ctx context.Context, userID string) error {
 }
 
 func (s *SessionService) mapRoleToZep(role string) zep.RoleType {
-	if role == "user" || role == "human" {
-		return zep.RoleType("human")
+	switch role {
+	case "user", "human":
+		return zep.RoleTypeUserRole
+	case "system":
+		return zep.RoleTypeSystemRole
+	default:
+		return zep.RoleTypeAssistantRole
 	}
-	return zep.RoleType("ai")
 }
 
 func (s *SessionService) AppendEvent(ctx context.Context, sess session.Session, event *session.Event) error {
@@ -228,7 +232,7 @@ func (s *SessionService) fetchHistory(ctx context.Context, sessionID string) ([]
 }
 
 func (s *SessionService) unmapRole(role zep.RoleType) string {
-	if role == zep.RoleType("human") {
+	if role == zep.RoleTypeUserRole {
 		return "user"
 	}
 	return s.agentName
