@@ -229,8 +229,12 @@ func (s *SessionService) fetchHistory(ctx context.Context, sessionID string) ([]
 			contentRole = "user"
 		}
 
+		content := msg.Content
+		if msg.Name != nil && *msg.Name != "" {
+			content = fmt.Sprintf("%s (%s): %s", *msg.Name, msg.Role, content)
+		}
 		evt.LLMResponse = model.LLMResponse{
-			Content: genai.NewContentFromText(msg.Content, genai.Role(contentRole)),
+			Content: genai.NewContentFromText(content, genai.Role(contentRole)),
 		}
 		events = append(events, evt)
 	}
