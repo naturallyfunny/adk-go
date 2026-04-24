@@ -9,6 +9,7 @@ import (
 	"github.com/getzep/zep-go/v3/option"
 	"go.naturallyfunny.dev/adk/zep"
 	"google.golang.org/adk/agent"
+	"google.golang.org/adk/runner"
 	"google.golang.org/genai"
 )
 
@@ -28,7 +29,8 @@ func main() {
 
 	// Initialize the ADK Runner
 	// We enable AutoCreateSession so the runner handles thread creation for us.
-	rnr, err := agent.NewRunner(svc, agent.Config{
+	rnr, err := runner.New(runner.Config{
+		SessionService:    svc,
 		AutoCreateSession: true,
 	})
 	if err != nil {

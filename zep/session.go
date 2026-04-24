@@ -110,13 +110,20 @@ func (s *SessionService) AppendEvent(ctx context.Context, sess session.Session, 
 		}
 	}
 
+	msg := &zep.Message{
+		Role:    zepRole,
+		Content: contentStr,
+	}
+	switch zepRole {
+	case zep.RoleTypeAssistantRole:
+		msg.Name = &s.agentName
+	case zep.RoleTypeUserRole:
+		userID := sess.UserID()
+		msg.Name = &userID
+	}
+
 	_, err := s.client.Thread.AddMessages(ctx, sess.ID(), &zep.AddThreadMessagesRequest{
-		Messages: []*zep.Message{
-			{
-				Role:    zepRole,
-				Content: contentStr,
-			},
-		},
+		Messages: []*zep.Message{msg},
 	})
 	if err != nil {
 		return err

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"go.naturallyfunny.dev/adk/session"
 	adksession "google.golang.org/adk/session"
@@ -47,4 +48,4 @@ type mockSession struct{ adksession.Session }
 func (m *mockSession) ID() string { return "mock-id" }
 func (m *mockSession) State() adksession.State { return nil }
 func (m *mockSession) Events() adksession.Events { return nil }
-func (m *mockSession) LastUpdateTime() (t java_time_Time) { return }
+func (m *mockSession) LastUpdateTime() time.Time { return time.Time{} }
